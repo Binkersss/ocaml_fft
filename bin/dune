@@ -1,0 +1,3 @@
+(executable
+  (name ft)
+  (ocamlopt_flags (:standard -unsafe -inline 100)))
