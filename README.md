@@ -23,3 +23,5 @@ Assuming you have dune, OCaml, etc.
 dune build --release ./bin/ft.exe
 ./_build/default/bin/ft.exe
 ```
+
+This code is licensed under the ISC license.
