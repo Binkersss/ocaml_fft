@@ -15,9 +15,9 @@
  *  PERFORMANCE OF THIS SOFTWARE.
  *
  *  NAS Parallel Benchmarks FT (3D FFT PDE solver), sequential OCaml port.
- *  Build:  ocamlfind ocamlopt -unsafe -inline 100 ft.ml -o ft
- *          (or: ocamlopt -unsafe -inline 100 ft.ml -o ft)
- *  Run:    ./ft [S|W|A|B|C]                                              
+ *  Build:  ocamlopt -unsafe -inline 100 -I +unix unix.cmxa ft.ml \
+ *            -cclib -lnuma -o ft.native
+ *  Run:    FT_FAR=0 ./ft.native [S|W|A|B|C]
  *)
 
 (* ---------- problem classes ---------- *)
@@ -99,11 +99,12 @@ let ipow46 a exponent =
    index of element (k,j,i) = (k*ny + j)*nx + i   (k: z, j: y, i: x)      *)
 type c3 = { re : float array; im : float array }
 
-let make_c3 n = { re = Array.make n 0.0; im = Array.make n 0.0 }
+let make_c3 ~far n =
+  { re = Array.make ~far n 0.0; im = Array.make ~far n 0.0 }
 
-let gen_initial_conditions g =
+let gen_initial_conditions ~far g =
   let plane = g.nx * g.ny in
-  let u = make_c3 (plane * g.nz) in
+  let u = make_c3 ~far (plane * g.nz) in
   let tmp = Array.make (2 * plane) 0.0 in
   let start = ref seed in
   (* the original's first jump is a^0 = 1, which leaves [start] unchanged *)
@@ -285,9 +286,9 @@ let fft g ur ui dir (input : c3) (output : c3) =
   end
 
 (* ---------- time evolution ---------- *)
-let compute_indexmap g =
+let compute_indexmap ~far g =
   let { nx; ny; nz; _ } = g in
-  let idx = Array.make (nx * ny * nz) 0 in
+  let idx = Array.make ~far (nx * ny * nz) 0 in
   let fold i n = ((i + (n / 2)) mod n) - (n / 2) in
   for k = 0 to nz - 1 do
     let kk = fold k nz in
@@ -301,11 +302,11 @@ let compute_indexmap g =
   done;
   idx
 
-let compute_exp g =
+let compute_exp ~far g =
   let expmax =
     g.niter * ((g.nx * g.nx / 4) + (g.ny * g.ny / 4) + (g.nz * g.nz / 4))
   in
-  let ex = Array.make (expmax + 1) 0.0 in
+  let ex = Array.make ~far (expmax + 1) 0.0 in
   ex.(0) <- 1.0;
   ex.(1) <- exp (-4.0 *. alpha *. pi *. pi);
   for i = 2 to expmax do
@@ -330,10 +331,7 @@ let checksum g sums iter (u : c3) =
     ci := !ci +. u.im.(p)
   done;
   let ntotal = float_of_int (nx * ny * nz) in
-  sums.(iter) <- (!cr /. ntotal, !ci /. ntotal);
-  Printf.printf "T = %5d     Checksum = %20.12e %20.12e\n" iter
-    (fst sums.(iter))
-    (snd sums.(iter))
+  sums.(iter) <- (!cr /. ntotal, !ci /. ntotal)
 
 (* ---------- verification (reference values from NPB, scaled by 1e2) ---------- *)
 let ref_values = function
@@ -488,8 +486,10 @@ let verify g sums =
   let ok = ref true in
   for i = 1 to g.niter do
     let sr, si = sums.(i) in
-    if abs_float ((sr -. rr.(i - 1)) /. rr.(i - 1)) >= eps then ok := false;
-    if abs_float ((si -. ri.(i - 1)) /. ri.(i - 1)) >= eps then ok := false
+    if not (abs_float ((sr -. rr.(i - 1)) /. rr.(i - 1)) < eps) then
+      ok := false;
+    if not (abs_float ((si -. ri.(i - 1)) /. ri.(i - 1)) < eps) then
+      ok := false
   done;
   !ok
 
@@ -497,20 +497,32 @@ let verify g sums =
 let () =
   let cls = if Array.length Sys.argv > 1 then Sys.argv.(1) else "S" in
   let g = params_of cls in
+  let mask =
+    match Sys.getenv_opt "FT_FAR" with
+    | None -> 0
+    | Some s ->
+        match int_of_string_opt s with
+        | Some n when n >= 0 && n <= 31 -> n
+        | _ -> invalid_arg "FT_FAR must be an integer from 0 to 31"
+  in
+  let far bit = mask land (1 lsl bit) <> 0 in
   Printf.printf "\n NAS Parallel Benchmarks - FT (OCaml, sequential)\n";
   Printf.printf " Size : %dx%dx%d   Iterations : %d\n" g.nx g.ny g.nz g.niter;
+  Printf.printf " FT_FAR : %d (u0=%b u1=%b u2=%b indexmap=%b ex=%b)\n%!"
+    mask (far 0) (far 1) (far 2) (far 3) (far 4);
   let t0 = Sys.time () in
   let nmax = max g.nx (max g.ny g.nz) in
   let ur = Array.make nmax 0.0 and ui = Array.make nmax 0.0 in
-  let indexmap = compute_indexmap g in
-  let ex = compute_exp g in
-  let u1 = gen_initial_conditions g in
-  let u0 = make_c3 (g.nx * g.ny * g.nz) in
-  let u2 = make_c3 (g.nx * g.ny * g.nz) in
+  let indexmap = compute_indexmap ~far:(far 3) g in
+  let ex = compute_exp ~far:(far 4) g in
+  let u1 = gen_initial_conditions ~far:(far 1) g in
+  let u0 = make_c3 ~far:(far 0) (g.nx * g.ny * g.nz) in
+  let u2 = make_c3 ~far:(far 2) (g.nx * g.ny * g.nz) in
   fft_init nmax ur ui;
   fft g ur ui 1 u1 u0;
   (* u0 = FFT(initial conditions) *)
   let sums = Array.make (g.niter + 1) (0.0, 0.0) in
+  let loop_start = Unix.gettimeofday () in
   for iter = 1 to g.niter do
     evolve u0 u1 iter indexmap ex;
     (* u1 = u0 * exp(-4 pi^2 alpha t |k|^2) *)
@@ -518,7 +530,15 @@ let () =
     (* u2 = IFFT(u1) *)
     checksum g sums iter u2
   done;
+  let loop_wall_time = Unix.gettimeofday () -. loop_start in
   let ok = verify g sums in
-  Printf.printf " Verification: %s\n Time: %.3f s\n"
+  let total_cpu_time = Sys.time () -. t0 in
+  for iter = 1 to g.niter do
+    let sr, si = sums.(iter) in
+    Printf.printf "T = %5d     Checksum = %20.12e %20.12e\n" iter sr si
+  done;
+  Printf.printf
+    " Verification: %s\n Total CPU time: %.6f s\n Loop wall time: %.6f s\n%!"
     (if ok then "SUCCESSFUL" else "FAILED")
-    (Sys.time () -. t0)
+    total_cpu_time loop_wall_time;
+  if not ok then exit 1
